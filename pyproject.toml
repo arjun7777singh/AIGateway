@@ -1,7 +1,29 @@
 [project]
-name = "aigateway"
-version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
-requires-python = ">=3.11"
-dependencies = []
+name = "ai-gateway"
+version = "0.0.1"
+description = "Self-hosted AI gateway with policy-based screening"
+requires-python = ">=3.12"
+dependencies = [
+    "gateway",
+]
+
+[tool.uv.workspace]
+members = ["apps/gateway", "packages/core", "packages/providers"]
+
+[tool.uv.sources]
+core = { workspace = true }
+providers = { workspace = true }
+gateway = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
