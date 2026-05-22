@@ -5,18 +5,24 @@ screening pipeline will sit between this route and the provider call.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import time
 from typing import AsyncIterator, Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException
+import httpx
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from providers import OllamaProvider, ProviderRequest
 
+from gateway import errors
 from gateway.config import settings
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1")
 
@@ -74,7 +80,7 @@ def _wrap_chunk(delta: str, model: str, finish_reason: Optional[str]) -> dict:
 
 def _build_provider_request(body: ChatCompletionRequest) -> ProviderRequest:
     if not body.messages:
-        raise HTTPException(status_code=400, detail="messages must not be empty")
+        raise errors.InvalidRequest("messages must not be empty")
 
     extra: dict = {}
     if body.temperature is not None:
@@ -92,18 +98,62 @@ def _build_provider_request(body: ChatCompletionRequest) -> ProviderRequest:
     )
 
 
-@router.post("/chat/completions")
-async def chat_completions(body: ChatCompletionRequest):
-    preq = _build_provider_request(body)
+def _as_gateway_error(exc: BaseException) -> errors.GatewayError:
+    """Coerce an httpx error into a typed gateway error, or wrap generic ones."""
+    if isinstance(exc, errors.GatewayError):
+        return exc
+    mapped = errors.map_httpx_exception(exc, provider=_provider.name)
+    if mapped is not None:
+        return mapped
+    return errors.GatewayError("internal error")
 
+
+@router.post("/chat/completions")
+async def chat_completions(request: Request, body: ChatCompletionRequest):
+    preq = _build_provider_request(body)
+    rid: Optional[str] = getattr(request.state, "request_id", None)
+
+    # --- Non-streaming: errors propagate to the handlers in errors.py.
     if not body.stream:
         resp = await _provider.complete(preq)
-        return JSONResponse(_wrap_response(resp.content, resp.model, resp.finish_reason, resp.usage))
+        return JSONResponse(
+            _wrap_response(resp.content, resp.model, resp.finish_reason, resp.usage)
+        )
+
+    # --- Streaming: peek at the first chunk so connect/timeout/upstream-status
+    # errors return a proper HTTP error code BEFORE we commit to a 200 SSE
+    # stream. Errors AFTER the first chunk are emitted in-band, then [DONE].
+    agen = _provider.stream(preq)
+    first: Optional[object] = None
+    try:
+        first = await agen.__anext__()
+    except StopAsyncIteration:
+        first = None  # empty stream — still send [DONE]
+    except (httpx.HTTPError, errors.GatewayError) as exc:
+        # Don't swallow: surface as a real HTTP error response.
+        raise _as_gateway_error(exc) from exc
 
     async def event_stream() -> AsyncIterator[str]:
-        async for chunk in _provider.stream(preq):
-            payload = _wrap_chunk(chunk.delta, preq.model, chunk.finish_reason)
-            yield f"data: {json.dumps(payload)}\n\n"
-        yield "data: [DONE]\n\n"
+        try:
+            if first is not None:
+                yield f"data: {json.dumps(_wrap_chunk(first.delta, preq.model, first.finish_reason))}\n\n"  # type: ignore[attr-defined]
+            async for chunk in agen:
+                yield f"data: {json.dumps(_wrap_chunk(chunk.delta, preq.model, chunk.finish_reason))}\n\n"
+        except asyncio.CancelledError:
+            logger.info("client disconnected mid-stream", extra={"request_id": rid})
+            raise
+        except (httpx.HTTPError, errors.GatewayError) as exc:
+            gw = _as_gateway_error(exc)
+            logger.warning(
+                "stream error after first chunk",
+                extra={"request_id": rid, "error_type": gw.error_type},
+            )
+            yield f"data: {json.dumps(errors.error_chunk(gw, rid))}\n\n"
+        except Exception:
+            logger.exception("unexpected stream error", extra={"request_id": rid})
+            gw = errors.GatewayError("internal error")
+            yield f"data: {json.dumps(errors.error_chunk(gw, rid))}\n\n"
+        finally:
+            yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
