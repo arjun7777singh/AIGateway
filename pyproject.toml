@@ -5,6 +5,7 @@ description = "Self-hosted AI gateway with policy-based screening"
 requires-python = ">=3.12"
 dependencies = [
     "gateway",
+    "respx>=0.23.1",
 ]
 
 [tool.uv.workspace]
