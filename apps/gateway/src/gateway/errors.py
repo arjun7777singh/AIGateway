@@ -228,8 +228,12 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 
 def install(app: FastAPI) -> None:
     """Register all exception handlers on the app."""
-    app.add_exception_handler(GatewayError, gateway_error_handler)
-    app.add_exception_handler(httpx.HTTPError, httpx_error_handler)
-    app.add_exception_handler(HTTPException, http_exception_handler)
-    app.add_exception_handler(RequestValidationError, validation_error_handler)
+    app.add_exception_handler(GatewayError, gateway_error_handler) # type: ignore[arg-type]
+
+    app.add_exception_handler(httpx.HTTPError, httpx_error_handler) # type: ignore[arg-type]
+
+    app.add_exception_handler(HTTPException, http_exception_handler) # type: ignore[arg-type]
+
+    app.add_exception_handler(RequestValidationError, validation_error_handler) # type: ignore[arg-type]
+
     app.add_exception_handler(Exception, unhandled_exception_handler)
