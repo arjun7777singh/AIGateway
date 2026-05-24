@@ -12,6 +12,8 @@ dependencies = [
     "structlog>=24.4",
     "core",
     "providers",
+    "policy",
+    "detectors",
 ]
 
 [build-system]

@@ -1,0 +1,32 @@
+apiVersion: gateway.ai/v1
+kind: Policy
+metadata:
+  id: pol_default_baseline
+  name: "Default baseline policy"
+  tenant: default
+  scope:
+    teams: ["*"]
+    applications: ["*"]
+    routes: ["/v1/chat/completions"]
+  enabled: true
+  # Switch to "dry_run" to observe decisions in logs without enforcing.
+  # Switch to "disabled" to bypass screening entirely.
+  mode: enforce
+
+spec:
+  defaultAction: allow
+  defaultFailureMode: fail_closed
+
+  inbound:
+    - detector: secrets.regex
+      enabled: true
+      # No `rulesets` key → all rulesets enabled (aws, github, openai,
+      # anthropic, jwt, private_key, google).
+      config: {}
+      on_match:
+        any:
+          action: block
+          message: "Request blocked: credential or API key detected in prompt"
+
+  # Outbound screening lands when the streaming evaluator does.
+  outbound: []

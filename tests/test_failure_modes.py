@@ -18,7 +18,7 @@ OLLAMA_URL = "http://localhost:11434/v1/chat/completions"
 GW_URL = "/v1/chat/completions"
 
 OK_BODY = {
-    "model": "llama3.2:3b",
+    "model": "qwen3:14b",
     "messages": [{"role": "user", "content": "hi"}],
 }
 

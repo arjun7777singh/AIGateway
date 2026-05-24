@@ -1,7 +1,18 @@
 """OpenAI-compatible /v1/chat/completions endpoint.
 
-For the skeleton this is a straight proxy to the upstream provider. The
-screening pipeline will sit between this route and the provider call.
+Request lifecycle:
+  1. Parse + validate the body.
+  2. Resolve the active policy for the request's tenant.
+  3. Run inbound screening on each message's text.
+     - block  → raise PolicyBlocked (returns 403 with envelope)
+     - redact → replace the message content with the redacted text
+     - log/allow → continue
+  4. Call the upstream provider.
+  5. (Outbound screening — added in a later iteration.)
+
+The peek-first pattern for streaming carries over from the error layer:
+upfront failures get proper HTTP codes; in-stream failures get an in-band
+error event followed by [DONE].
 """
 from __future__ import annotations
 
@@ -13,13 +24,14 @@ from typing import AsyncIterator, Optional
 from uuid import uuid4
 
 import httpx
+from core import Content, RequestContext
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from providers import OllamaProvider, ProviderRequest
 
-from gateway import errors
+from gateway import errors, screening
 from gateway.config import settings
 
 logger = logging.getLogger(__name__)
@@ -43,8 +55,9 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
 
 
+# --- Shaping helpers (unchanged from the skeleton) ----------------------
+
 def _wrap_response(content: str, model: str, finish_reason: str, usage: Optional[dict]) -> dict:
-    """Shape a provider response into OpenAI's chat.completion JSON."""
     return {
         "id": f"chatcmpl-{uuid4().hex}",
         "object": "chat.completion",
@@ -62,7 +75,6 @@ def _wrap_response(content: str, model: str, finish_reason: str, usage: Optional
 
 
 def _wrap_chunk(delta: str, model: str, finish_reason: Optional[str]) -> dict:
-    """Shape a stream chunk into OpenAI's chat.completion.chunk JSON."""
     return {
         "id": f"chatcmpl-{uuid4().hex}",
         "object": "chat.completion.chunk",
@@ -99,7 +111,6 @@ def _build_provider_request(body: ChatCompletionRequest) -> ProviderRequest:
 
 
 def _as_gateway_error(exc: BaseException) -> errors.GatewayError:
-    """Coerce an httpx error into a typed gateway error, or wrap generic ones."""
     if isinstance(exc, errors.GatewayError):
         return exc
     mapped = errors.map_httpx_exception(exc, provider=_provider.name)
@@ -108,29 +119,121 @@ def _as_gateway_error(exc: BaseException) -> errors.GatewayError:
     return errors.GatewayError("internal error")
 
 
+# --- Screening glue ------------------------------------------------------
+
+async def _run_inbound_screening(
+    *,
+    request: Request,
+    ctx: RequestContext,
+    messages: list[dict],
+) -> list[dict]:
+    """Screen every message; mutate (or replace) on redact, raise on block.
+
+    Returns the (possibly-modified) messages list to forward to the provider.
+    """
+    store = getattr(request.app.state, "policy_store", None)
+    registry = getattr(request.app.state, "detector_registry", None)
+    if store is None or registry is None:
+        # No screening configured — pass through. (Should only happen
+        # before startup completes; tests that don't run the lifecycle
+        # also land here.)
+        return messages
+
+    policy = store.get_for_tenant(ctx.tenant_id)
+    if policy is None:
+        return messages
+
+    out: list[dict] = []
+    for i, msg in enumerate(messages):
+        text = msg.get("content")
+        if not isinstance(text, str) or not text:
+            out.append(msg)
+            continue
+
+        content = Content(direction="inbound", text=text)
+        result = await screening.screen(
+            content=content,
+            policy=policy,
+            ctx=ctx,
+            registry=registry,
+        )
+
+        if result.skipped:
+            out.append(msg)
+            continue
+
+        # Log the decision. Audit emitter lands in a later iteration; for
+        # now structured logs are the breadcrumb.
+        if result.findings:
+            logger.info(
+                "screening decision",
+                extra={
+                    "request_id": ctx.request_id,
+                    "tenant": ctx.tenant_id,
+                    "policy_id": policy.metadata.id,
+                    "policy_mode": policy.metadata.mode,
+                    "intended_action": result.intended_action,
+                    "actual_action": result.actual_action,
+                    "message_index": i,
+                    "finding_categories": [f.category for f in result.findings],
+                },
+            )
+
+        if result.blocked:
+            raise errors.PolicyBlocked(
+                result.block_message or "request blocked by policy",
+                details={
+                    "policy_id": policy.metadata.id,
+                    "mode": policy.metadata.mode,
+                    "categories": sorted({f.category for f in result.findings}),
+                },
+            )
+
+        if result.actual_action == "redact" and result.redacted_text is not None:
+            new_msg = dict(msg)
+            new_msg["content"] = result.redacted_text
+            out.append(new_msg)
+        else:
+            out.append(msg)
+
+    return out
+
+
+# --- Route ---------------------------------------------------------------
+
 @router.post("/chat/completions")
 async def chat_completions(request: Request, body: ChatCompletionRequest):
-    preq = _build_provider_request(body)
     rid: Optional[str] = getattr(request.state, "request_id", None)
+    ctx = RequestContext(
+        request_id=rid or f"req_{uuid4().hex}",
+        tenant_id=settings.default_tenant,
+    )
 
-    # --- Non-streaming: errors propagate to the handlers in errors.py.
+    # Inbound screening BEFORE we build the provider request, so we never
+    # leak a redacted prompt back into the wire format we send upstream.
+    body_messages = await _run_inbound_screening(
+        request=request, ctx=ctx, messages=body.messages
+    )
+    body.messages = body_messages
+
+    preq = _build_provider_request(body)
+
+    # --- Non-streaming.
     if not body.stream:
         resp = await _provider.complete(preq)
         return JSONResponse(
             _wrap_response(resp.content, resp.model, resp.finish_reason, resp.usage)
         )
 
-    # --- Streaming: peek at the first chunk so connect/timeout/upstream-status
-    # errors return a proper HTTP error code BEFORE we commit to a 200 SSE
-    # stream. Errors AFTER the first chunk are emitted in-band, then [DONE].
+    # --- Streaming: peek at the first chunk so upstream errors return a
+    # proper HTTP error code BEFORE we commit to a 200 SSE stream.
     agen = _provider.stream(preq)
     first: Optional[object] = None
     try:
         first = await agen.__anext__()
     except StopAsyncIteration:
-        first = None  # empty stream — still send [DONE]
+        first = None
     except (httpx.HTTPError, errors.GatewayError) as exc:
-        # Don't swallow: surface as a real HTTP error response.
         raise _as_gateway_error(exc) from exc
 
     async def event_stream() -> AsyncIterator[str]:

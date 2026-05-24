@@ -1,6 +1,6 @@
 """Policy schema (apiVersion: gateway.ai/v1).
 
-Direct translation of the YAML contract:
+Direct translation of the YAML contract we agreed on:
 
   - metadata: id, name, tenant, scope, enabled, mode
   - spec.defaultAction / defaultFailureMode

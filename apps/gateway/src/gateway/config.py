@@ -26,7 +26,13 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
 
     # Default model used if a client request omits the field.
-    default_model: str = "qwen3:14b"
+    default_model: str = "llama3.2:3b"
+
+    # Policy engine
+    policies_dir: str = "./policies"
+    # Tenant used when no API key auth is in place yet. The screening
+    # pipeline looks up the policy by this id.
+    default_tenant: str = "default"
 
 
 settings = Settings()

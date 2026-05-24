@@ -5,15 +5,16 @@ description = "Self-hosted AI gateway with policy-based screening"
 requires-python = ">=3.12"
 dependencies = [
     "gateway",
-    "respx>=0.23.1",
 ]
 
 [tool.uv.workspace]
-members = ["apps/gateway", "packages/core", "packages/providers"]
+members = ["apps/gateway", "packages/core", "packages/providers", "packages/policy", "packages/detectors"]
 
 [tool.uv.sources]
 core = { workspace = true }
 providers = { workspace = true }
+policy = { workspace = true }
+detectors = { workspace = true }
 gateway = { workspace = true }
 
 [dependency-groups]
@@ -21,14 +22,22 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "httpx>=0.27",
+    "respx>=0.22",
     "ruff>=0.5",
     "mypy>=1.10",
 ]
 
+[tool.pytest.ini_options]
+pythonpath = [
+    "apps/gateway/src",
+    "packages/core/src",
+    "packages/providers/src",
+    "packages/policy/src",
+    "packages/detectors/src",
+]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-
-[tool.pytest.ini_options]
-pythonpath = ["apps/gateway/src", "packages/core/src", "packages/providers/src"]
-testpaths = ["tests"]
