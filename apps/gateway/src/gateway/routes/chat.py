@@ -203,11 +203,19 @@ async def _run_inbound_screening(
 
 @router.post("/chat/completions")
 async def chat_completions(request: Request, body: ChatCompletionRequest):
-    rid: Optional[str] = getattr(request.state, "request_id", None)
-    ctx = RequestContext(
-        request_id=rid or f"req_{uuid4().hex}",
-        tenant_id=settings.default_tenant,
+    # The auth middleware populates request.state.context. In open mode
+    # (auth_required=False, no key presented) it's a default-tenant ctx.
+    # In tests that bypass the middleware, fall back to a synthetic one
+    # so the route still works in isolation.
+    ctx: RequestContext = getattr(
+        request.state,
+        "context",
+        RequestContext(
+            request_id=getattr(request.state, "request_id", None) or f"req_{uuid4().hex}",
+            tenant_id=settings.default_tenant,
+        ),
     )
+    rid = ctx.request_id
 
     # Inbound screening BEFORE we build the provider request, so we never
     # leak a redacted prompt back into the wire format we send upstream.

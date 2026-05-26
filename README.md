@@ -1,32 +1,31 @@
 # AI Gateway
 
-Self-hosted AI gateway with policy-based screening. Sits between client applications and LLM providers, enforces per-tenant policies on inbound prompts (outbound coming soon), and emits a structured decision log for every request.
+Self-hosted AI gateway with policy-based screening and per-tenant API key auth. Sits between client applications and LLM providers, enforces per-tenant policies on inbound prompts, and emits a structured decision log for every request.
 
 ## Status
-
-End-to-end policy enforcement working:
 
 - OpenAI-compatible front door at `/v1/chat/completions`
 - Ollama upstream adapter (uses Ollama's OpenAI-compatible endpoint)
 - Streaming and non-streaming both work end-to-end
 - Hardened error layer: typed envelope, request_id propagation, peek-pattern for streaming connect/timeout errors
-- **Policy engine: YAML-defined policies, hot-loadable, per-tenant**
-- **Detector framework: pluggable `Detector` ABC + registry**
-- **First detector: `secrets.regex` (AWS, GitHub, OpenAI, Anthropic, JWT, PEM private keys, Google API keys)**
-- **Screening orchestrator: parallel detector dispatch, severity → action mapping, redaction, dry-run support**
+- Policy engine: YAML-defined policies, hot-loadable, per-tenant
+- Detector framework: pluggable `Detector` ABC + registry
+- First detector: `secrets.regex` (AWS, GitHub, OpenAI, Anthropic, JWT, PEM private keys, Google API keys)
+- Screening orchestrator: parallel detector dispatch, severity → action mapping, redaction, dry-run support
+- **API key auth: tenants → applications → keys, two-header support, open + strict modes, exempt paths**
+- **Per-tenant policy routing: each key resolves to a tenant, which selects the active policy**
 
 Not yet:
 
-- API key auth + tenant resolution (currently uses `default` tenant for all traffic)
-- ML-based detectors (prompt injection, PII via Presidio, safety classifier)
+- ML-based detectors (prompt injection via classifier, PII via Presidio)
 - Outbound streaming evaluator (algorithm designed; implementation pending)
 - Audit event emission (decisions are logged but not stored in a queryable form yet)
-- Postgres + Redis
+- Postgres + Redis (everything in-memory from YAML)
 
 ## Requirements
 
 - Python 3.12+
-- [uv](https://docs.astral.sh/uv/) for package management
+- [uv](https://docs.astral.sh/uv/)
 - A running [Ollama](https://ollama.com/) with at least one model pulled (default: `llama3.2:3b`)
 
 ## Run
@@ -37,87 +36,119 @@ cp .env.example .env             # optional, defaults are fine
 uv run uvicorn gateway.main:app --reload --port 8080
 ```
 
-The startup log line tells you how many detectors and policies were loaded:
+Boot log:
 
 ```
-INFO gateway [-] boot: 1 detectors registered, 1 policies loaded from ./policies
+INFO gateway [-] boot: 1 detectors, 1 policies (from ./policies), 0 identity keys (auth_required=False)
 ```
 
-Health check (shows what's loaded):
+Health check:
 
 ```sh
 curl -s http://localhost:8080/healthz | jq
-# {
-#   "status": "ok",
-#   "provider": "ollama",
-#   "detectors": ["secrets.regex"],
-#   "policies_loaded": 1
-# }
 ```
 
-## See the policy engine fire
+## Auth modes
 
-Clean prompt — passes through:
+The gateway has two operating modes for auth, controlled by `GW_AUTH_REQUIRED`:
+
+**Open mode** (`GW_AUTH_REQUIRED=false`, the default for local dev): requests without a key are accepted and mapped to the `default` tenant. A presented-but-invalid key is still rejected with 401 — silent fallback would mask config mistakes.
+
+**Strict mode** (`GW_AUTH_REQUIRED=true`): every non-exempt request must present a valid key. Exempt paths (currently `/healthz`) bypass auth regardless.
+
+## Adding API keys
+
+Generate a key:
+
+```sh
+uv run python -m identity.gen --description "Production chatbot key"
+```
+
+The raw key is printed to stderr **once** and cannot be recovered later — copy it to your secret manager. The YAML snippet that prints (on stdout) goes under an application's `keys:` list in `identity.yaml`:
+
+```yaml
+tenants:
+  - id: acme
+    name: "Acme Corp"
+    applications:
+      - id: chatbot
+        name: "Customer Chatbot"
+        keys:
+          - id: key_4c32cc71bd3c41fb
+            hash: "sha256:2b97ae9728..."
+            prefix: "gw_live_a6a565fd"
+            created_at: "2026-05-24T05:32:13.973715+00:00"
+            enabled: true
+            description: "Production chatbot key"
+```
+
+Start `identity.yaml` from the example:
+
+```sh
+cp identity.yaml.example identity.yaml
+# then paste your generated keys under an application
+```
+
+Restart the gateway. New keys are loaded at boot (hot reload coming later).
+
+Tenant `id` in `identity.yaml` must match `metadata.tenant` in a policy file. If a key resolves to a tenant with no matching policy, screening is skipped — the request passes through unchecked. Use this intentionally (a tenant in observe-mode-by-omission) or set up a default policy.
+
+## See it fire
+
+Clean prompt, no key (open mode):
 
 ```sh
 curl -s http://localhost:8080/v1/chat/completions \
   -H 'content-type: application/json' \
-  -d '{"messages": [{"role": "user", "content": "Say hello."}]}' | jq
+  -d '{"messages":[{"role":"user","content":"Say hello."}]}' | jq
 ```
 
-Prompt with an AWS access key — blocked with a 403:
+Same, with an AWS key — blocked:
 
 ```sh
 curl -s http://localhost:8080/v1/chat/completions \
   -H 'content-type: application/json' \
-  -d '{"messages": [{"role": "user", "content": "debug: AKIAIOSFODNN7EXAMPLE"}]}' | jq
-# {
-#   "error": {
-#     "type": "policy.blocked",
-#     "message": "Request blocked: credential or API key detected in prompt",
-#     "request_id": "req_...",
-#     "details": {
-#       "policy_id": "pol_default_baseline",
-#       "mode": "enforce",
-#       "categories": ["secret.aws_access_key_id"]
-#     }
-#   }
-# }
+  -d '{"messages":[{"role":"user","content":"debug: AKIAIOSFODNN7EXAMPLE"}]}' | jq
 ```
 
-To observe-without-enforcing, edit `policies/default.yaml` and change `mode: enforce` to `mode: dry_run`. The same request will now pass through, but you'll see a structured log line recording `intended_action=block actual_action=allow`.
+With auth (strict mode on, valid key):
+
+```sh
+curl -s http://localhost:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -H 'authorization: Bearer gw_live_<your_key>' \
+  -d '{"messages":[{"role":"user","content":"Say hello."}]}' | jq
+```
+
+`X-Api-Key` works too, for clients that can't set `Authorization`.
 
 ## Test
 
 ```sh
 uv run pytest -v
-# 31 passed
+# 55 passed
 ```
 
 ## Layout
 
 ```
 ai-gateway/
-├── apps/
-│   └── gateway/                       # data plane (FastAPI)
-│       └── src/gateway/
-│           ├── main.py                # lifespan loads policies + registry
-│           ├── config.py
-│           ├── errors.py              # typed envelope + handlers
-│           ├── middleware.py          # request_id
-│           ├── screening.py           # orchestrator
-│           └── routes/chat.py
+├── apps/gateway/src/gateway/
+│   ├── main.py                    # lifespan loads everything
+│   ├── config.py
+│   ├── errors.py                  # typed envelope + handlers
+│   ├── middleware.py              # request_id
+│   ├── auth.py                    # API key resolution
+│   ├── screening.py               # orchestrator
+│   └── routes/chat.py
 ├── packages/
-│   ├── core/                          # Finding, Content, RequestContext, ...
-│   ├── providers/                     # Ollama adapter
-│   ├── policy/                        # PolicyV1 schema, YAML loader, store
-│   └── detectors/                     # Detector ABC, registry, secrets.regex
+│   ├── core/                      # Finding, Content, RequestContext, ...
+│   ├── providers/                 # Ollama adapter
+│   ├── policy/                    # PolicyV1 schema, YAML loader, store
+│   ├── detectors/                 # Detector ABC, registry, secrets.regex
+│   └── identity/                  # Tenant/App/ApiKey schema, store, key generator
 ├── policies/
-│   └── default.yaml                   # baseline: block secrets
-├── deploy/                            # docker-compose, helm (later)
-└── tests/
-    ├── test_failure_modes.py          # 12 tests
-    ├── test_policy_schema.py          # 7 tests
-    ├── test_secrets_detector.py       # 8 tests
-    └── test_screening_integration.py  # 4 tests (HTTP-level)
+│   └── default.yaml               # baseline: block secrets
+├── identity.yaml.example          # template for tenants + keys
+└── tests/                         # 55 tests
 ```

@@ -30,9 +30,19 @@ class Settings(BaseSettings):
 
     # Policy engine
     policies_dir: str = "./policies"
-    # Tenant used when no API key auth is in place yet. The screening
-    # pipeline looks up the policy by this id.
+    # Tenant used when auth is disabled. The screening pipeline looks
+    # up the policy by this id.
     default_tenant: str = "default"
+
+    # Identity / auth
+    identity_file: str = "./identity.yaml"
+    # When False, requests without (or with invalid) keys are accepted and
+    # mapped to `default_tenant`. When True, missing/invalid keys → 401.
+    # Defaults to False for local dev; flip to True in production.
+    auth_required: bool = False
+    # Paths that bypass auth entirely even when auth_required=True.
+    # Healthchecks and the like.
+    auth_exempt_paths: tuple[str, ...] = ("/healthz",)
 
 
 settings = Settings()

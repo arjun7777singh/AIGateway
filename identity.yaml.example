@@ -1,0 +1,19 @@
+# Identity configuration: tenants → applications → API keys.
+#
+# Generate a new key with:
+#   uv run python -m identity.gen --description "what this key is for"
+# then paste the YAML snippet it prints under an application's `keys:` list.
+#
+# Tenant `id` must match `metadata.tenant` in a policy file for the
+# screening rules to apply to that tenant's traffic.
+#
+# Copy this file to identity.yaml to use it, OR leave both files absent
+# and run with GW_AUTH_REQUIRED=false to use the default tenant.
+
+tenants:
+  - id: default
+    name: "Default tenant"
+    applications:
+      - id: dev
+        name: "Local development"
+        keys: []   # add generated keys here
